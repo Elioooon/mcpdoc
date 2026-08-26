@@ -1,10 +1,12 @@
 """Tests for mcpdoc.main module."""
 
+import httpx
 import pytest
 
 from mcpdoc.main import (
     _get_fetch_description,
     _is_http_or_https,
+    create_server,
     extract_domain,
 )
 
@@ -69,3 +71,85 @@ def test_get_fetch_description(has_local_sources, expected_substrings):
             # and "file://" are NOT present
             if substring in ["local file path", "file://"]:
                 assert substring not in description
+
+
+@pytest.mark.asyncio
+async def test_fetch_docs_blocks_cross_domain_http_redirect(monkeypatch) -> None:
+    """HTTP redirects must be checked against the allowed domains."""
+    async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://allowed.test/redirect":
+            return httpx.Response(
+                302,
+                headers={"location": "http://blocked.test/payload"},
+                request=request,
+            )
+        if str(request.url) == "http://blocked.test/payload":
+            return httpx.Response(
+                200, text="secret from blocked origin", request=request
+            )
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: async_client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=kwargs.get("follow_redirects", False),
+            timeout=kwargs.get("timeout"),
+        ),
+    )
+
+    server = create_server(
+        [{"llms_txt": "http://allowed.test/llms.txt"}],
+        follow_redirects=True,
+    )
+
+    result = await server.call_tool(
+        "fetch_docs",
+        {"url": "http://allowed.test/redirect"},
+    )
+
+    text = result[0][0].text
+    assert "Error: Redirect URL not allowed." in text
+    assert "secret from blocked origin" not in text
+
+
+@pytest.mark.asyncio
+async def test_fetch_docs_allows_same_domain_http_redirect(monkeypatch) -> None:
+    """Allowed redirect targets should still return their fetched content."""
+    async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == "http://allowed.test/redirect":
+            return httpx.Response(
+                302,
+                headers={"location": "http://allowed.test/final"},
+                request=request,
+            )
+        if str(request.url) == "http://allowed.test/final":
+            return httpx.Response(200, text="<h1>Allowed docs</h1>", request=request)
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: async_client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=kwargs.get("follow_redirects", False),
+            timeout=kwargs.get("timeout"),
+        ),
+    )
+
+    server = create_server(
+        [{"llms_txt": "http://allowed.test/llms.txt"}],
+        follow_redirects=True,
+    )
+
+    result = await server.call_tool(
+        "fetch_docs",
+        {"url": "http://allowed.test/redirect"},
+    )
+
+    assert "Allowed docs" in result[0][0].text

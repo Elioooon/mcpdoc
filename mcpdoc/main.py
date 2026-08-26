@@ -138,6 +138,11 @@ def _get_server_instructions(doc_sources: list[DocSource]) -> str:
     return "\n".join(instructions)
 
 
+def _url_allowed(url: str, domains: set[str]) -> bool:
+    """Return whether *url* starts with an allowed domain."""
+    return "*" in domains or any(url.startswith(domain) for domain in domains)
+
+
 def create_server(
     doc_sources: list[DocSource],
     *,
@@ -246,9 +251,7 @@ def create_server(
                 return f"Error reading local file: {str(e)}"
         else:
             # Otherwise treat as URL
-            if "*" not in domains and not any(
-                url.startswith(domain) for domain in domains
-            ):
+            if not _url_allowed(url, domains):
                 return (
                     "Error: URL not allowed. Must start with one of the following domains: "
                     + ", ".join(domains)
@@ -257,6 +260,12 @@ def create_server(
             try:
                 response = await httpx_client.get(url, timeout=timeout)
                 response.raise_for_status()
+                for visited_response in [*response.history, response]:
+                    if not _url_allowed(str(visited_response.url), domains):
+                        return (
+                            "Error: Redirect URL not allowed. Must start with one of the following domains: "
+                            + ", ".join(domains)
+                        )
                 content = response.text
 
                 if follow_redirects:
@@ -271,9 +280,7 @@ def create_server(
                         redirect_url = match.group(1)
                         new_url = urljoin(str(response.url), redirect_url)
 
-                        if "*" not in domains and not any(
-                            new_url.startswith(domain) for domain in domains
-                        ):
+                        if not _url_allowed(new_url, domains):
                             return (
                                 "Error: Redirect URL not allowed. Must start with one of the following domains: "
                                 + ", ".join(domains)
