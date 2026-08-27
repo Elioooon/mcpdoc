@@ -77,8 +77,10 @@ def test_get_fetch_description(has_local_sources, expected_substrings):
 async def test_fetch_docs_blocks_cross_domain_http_redirect(monkeypatch) -> None:
     """HTTP redirects must be checked against the allowed domains."""
     async_client = httpx.AsyncClient
+    requested_urls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
         if str(request.url) == "http://allowed.test/redirect":
             return httpx.Response(
                 302,
@@ -114,6 +116,62 @@ async def test_fetch_docs_blocks_cross_domain_http_redirect(monkeypatch) -> None
     text = result[0][0].text
     assert "Error: Redirect URL not allowed." in text
     assert "secret from blocked origin" not in text
+    assert requested_urls == ["http://allowed.test/redirect"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_docs_blocks_meta_refresh_redirect_chain(monkeypatch) -> None:
+    """Meta-refresh follow-up redirects must be checked before fetching."""
+    async_client = httpx.AsyncClient
+    requested_urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        if str(request.url) == "http://allowed.test/page":
+            return httpx.Response(
+                200,
+                text='<meta http-equiv="refresh" content="0; url=/next">',
+                request=request,
+            )
+        if str(request.url) == "http://allowed.test/next":
+            return httpx.Response(
+                302,
+                headers={"location": "http://blocked.test/payload"},
+                request=request,
+            )
+        if str(request.url) == "http://blocked.test/payload":
+            return httpx.Response(
+                200, text="secret from blocked origin", request=request
+            )
+        raise AssertionError(f"Unexpected request: {request.url}")
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: async_client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=kwargs.get("follow_redirects", False),
+            timeout=kwargs.get("timeout"),
+        ),
+    )
+
+    server = create_server(
+        [{"llms_txt": "http://allowed.test/llms.txt"}],
+        follow_redirects=True,
+    )
+
+    result = await server.call_tool(
+        "fetch_docs",
+        {"url": "http://allowed.test/page"},
+    )
+
+    text = result[0][0].text
+    assert "Error: Redirect URL not allowed." in text
+    assert "secret from blocked origin" not in text
+    assert requested_urls == [
+        "http://allowed.test/page",
+        "http://allowed.test/next",
+    ]
 
 
 @pytest.mark.asyncio

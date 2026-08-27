@@ -9,6 +9,8 @@ from markdownify import markdownify
 from mcp.server.fastmcp import FastMCP
 from typing_extensions import NotRequired, TypedDict
 
+REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
+
 
 class DocSource(TypedDict):
     """A source of documentation for a library or a package."""
@@ -172,7 +174,7 @@ def create_server(
         instructions=_get_server_instructions(doc_sources),
         **settings,
     )
-    httpx_client = httpx.AsyncClient(follow_redirects=follow_redirects, timeout=timeout)
+    httpx_client = httpx.AsyncClient(follow_redirects=False, timeout=timeout)
 
     local_sources = []
     remote_sources = []
@@ -236,6 +238,34 @@ def create_server(
     async def fetch_docs(url: str) -> str:
         nonlocal domains, follow_redirects
         url = url.strip()
+
+        async def fetch_allowed_url(
+            current_url: str,
+        ) -> tuple[httpx.Response | None, str | None]:
+            for _ in range(20):
+                if not _url_allowed(current_url, domains):
+                    return (
+                        None,
+                        "Error: Redirect URL not allowed. Must start with one of the following domains: "
+                        + ", ".join(domains),
+                    )
+
+                response = await httpx_client.get(current_url, timeout=timeout)
+                if (
+                    not follow_redirects
+                    or response.status_code not in REDIRECT_STATUS_CODES
+                ):
+                    response.raise_for_status()
+                    return response, None
+
+                location = response.headers.get("location")
+                if not location:
+                    response.raise_for_status()
+                    return response, None
+                current_url = urljoin(str(response.url), location)
+
+            return None, "Error: Too many redirects."
+
         # Handle local file paths (either as file:// URLs or direct filesystem paths)
         if not _is_http_or_https(url):
             abs_path = _normalize_path(url)
@@ -258,14 +288,10 @@ def create_server(
                 )
 
             try:
-                response = await httpx_client.get(url, timeout=timeout)
-                response.raise_for_status()
-                for visited_response in [*response.history, response]:
-                    if not _url_allowed(str(visited_response.url), domains):
-                        return (
-                            "Error: Redirect URL not allowed. Must start with one of the following domains: "
-                            + ", ".join(domains)
-                        )
+                response, error = await fetch_allowed_url(url)
+                if error:
+                    return error
+                assert response is not None
                 content = response.text
 
                 if follow_redirects:
@@ -286,8 +312,10 @@ def create_server(
                                 + ", ".join(domains)
                             )
 
-                        response = await httpx_client.get(new_url, timeout=timeout)
-                        response.raise_for_status()
+                        response, error = await fetch_allowed_url(new_url)
+                        if error:
+                            return error
+                        assert response is not None
                         content = response.text
 
                 return markdownify(content)
