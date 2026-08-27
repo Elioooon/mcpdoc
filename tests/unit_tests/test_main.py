@@ -211,3 +211,78 @@ async def test_fetch_docs_allows_same_domain_http_redirect(monkeypatch) -> None:
     )
 
     assert "Allowed docs" in result[0][0].text
+
+
+@pytest.mark.asyncio
+async def test_fetch_docs_stops_after_twenty_redirects(monkeypatch) -> None:
+    """Redirect chains must be bounded."""
+    async_client = httpx.AsyncClient
+    requested_urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(
+            302,
+            headers={"location": f"/redirect/{len(requested_urls)}"},
+            request=request,
+        )
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: async_client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=kwargs.get("follow_redirects", False),
+            timeout=kwargs.get("timeout"),
+        ),
+    )
+
+    server = create_server(
+        [{"llms_txt": "http://allowed.test/llms.txt"}],
+        follow_redirects=True,
+    )
+    result = await server.call_tool(
+        "fetch_docs",
+        {"url": "http://allowed.test/redirect"},
+    )
+
+    assert "Error: Too many redirects." in result[0][0].text
+    assert len(requested_urls) == 20
+
+
+@pytest.mark.asyncio
+async def test_fetch_docs_does_not_follow_304_location(monkeypatch) -> None:
+    """A 304 response with Location is not an HTTP redirect."""
+    async_client = httpx.AsyncClient
+    requested_urls = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_urls.append(str(request.url))
+        return httpx.Response(
+            304,
+            headers={"location": "http://blocked.test/payload"},
+            text="<h1>Not redirected</h1>",
+            request=request,
+        )
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda *args, **kwargs: async_client(
+            transport=httpx.MockTransport(handler),
+            follow_redirects=kwargs.get("follow_redirects", False),
+            timeout=kwargs.get("timeout"),
+        ),
+    )
+
+    server = create_server(
+        [{"llms_txt": "http://allowed.test/llms.txt"}],
+        follow_redirects=True,
+    )
+    result = await server.call_tool(
+        "fetch_docs",
+        {"url": "http://allowed.test/not-modified"},
+    )
+
+    assert "304 Not Modified" in result[0][0].text
+    assert requested_urls == ["http://allowed.test/not-modified"]
