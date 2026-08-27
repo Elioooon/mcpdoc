@@ -214,13 +214,18 @@ async def test_fetch_docs_allows_same_domain_http_redirect(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_fetch_docs_stops_after_twenty_redirects(monkeypatch) -> None:
-    """Redirect chains must be bounded."""
+@pytest.mark.parametrize(("redirects", "succeeds"), [(20, True), (21, False)])
+async def test_fetch_docs_redirect_limit_matches_httpx(
+    monkeypatch, redirects, succeeds
+) -> None:
+    """Allow 20 redirects and reject the 21st, matching httpx."""
     async_client = httpx.AsyncClient
     requested_urls = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         requested_urls.append(str(request.url))
+        if len(requested_urls) > redirects:
+            return httpx.Response(200, text="<h1>Final docs</h1>", request=request)
         return httpx.Response(
             302,
             headers={"location": f"/redirect/{len(requested_urls)}"},
@@ -246,8 +251,11 @@ async def test_fetch_docs_stops_after_twenty_redirects(monkeypatch) -> None:
         {"url": "http://allowed.test/redirect"},
     )
 
-    assert "Error: Too many redirects." in result[0][0].text
-    assert len(requested_urls) == 20
+    if succeeds:
+        assert "Final docs" in result[0][0].text
+    else:
+        assert "Error: Too many redirects." in result[0][0].text
+    assert len(requested_urls) == 21
 
 
 @pytest.mark.asyncio

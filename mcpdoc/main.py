@@ -9,8 +9,6 @@ from markdownify import markdownify
 from mcp.server.fastmcp import FastMCP
 from typing_extensions import NotRequired, TypedDict
 
-REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
-
 
 class DocSource(TypedDict):
     """A source of documentation for a library or a package."""
@@ -242,7 +240,7 @@ def create_server(
         async def fetch_allowed_url(
             current_url: str,
         ) -> tuple[httpx.Response | None, str | None]:
-            for _ in range(20):
+            for redirect_count in range(httpx_client.max_redirects + 1):
                 if not _url_allowed(current_url, domains):
                     return (
                         None,
@@ -251,10 +249,7 @@ def create_server(
                     )
 
                 response = await httpx_client.get(current_url, timeout=timeout)
-                if (
-                    not follow_redirects
-                    or response.status_code not in REDIRECT_STATUS_CODES
-                ):
+                if not follow_redirects or not response.has_redirect_location:
                     response.raise_for_status()
                     return response, None
 
@@ -262,9 +257,11 @@ def create_server(
                 if not location:
                     response.raise_for_status()
                     return response, None
+                if redirect_count == httpx_client.max_redirects:
+                    return None, "Error: Too many redirects."
                 current_url = urljoin(str(response.url), location)
 
-            return None, "Error: Too many redirects."
+            raise AssertionError("unreachable")
 
         # Handle local file paths (either as file:// URLs or direct filesystem paths)
         if not _is_http_or_https(url):
